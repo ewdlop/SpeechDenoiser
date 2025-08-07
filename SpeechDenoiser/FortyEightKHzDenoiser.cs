@@ -1,6 +1,7 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using NAudio.Wave;
+using TorchSharp.Modules;
 using static TorchSharp.torch;
 using static TorchSharp.torch.nn.functional;
 using Tensor = TorchSharp.torch.Tensor;
