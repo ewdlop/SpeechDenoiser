@@ -1,150 +1,149 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
-using NumSharp;
 using TorchSharp;
 using static TorchSharp.torch;
-using System.Collections.Concurrent;
 
 class Realtime16KAudioDenoiser
 {
     const int SampleRate = 16000;
-    const int n_fft = 512;
-    const int hop_length = 256;
-    const int win_length = 512;
+    const int NFFT = 512;
+    const int HopLength = 256;
+    const int WinLength = 512;
 
-    private static InferenceSession session;
-    private static NDArray conv_cache;
-    private static NDArray tra_cache;
-    private static NDArray inter_cache;
-    private static torch.Tensor window;
-
-    private static BufferedWaveProvider outputBuffer;
-    private static ConcurrentQueue<float> processQueue = new ConcurrentQueue<float>();
+    static InferenceSession session;
+    static float[,,,,] conv_cache = new float[2, 1, 16, 16, 33];
+    static float[,,,,] tra_cache = new float[2, 3, 1, 1, 16];
+    static float[,,,] inter_cache = new float[2, 1, 33, 16];
 
     public static void Main(string[] args)
     {
-        // --- 初始化 ONNX Session ---
         session = new InferenceSession("gtcrn_simple.onnx");
-        conv_cache = np.zeros(new Shape(2, 1, 16, 16, 33), np.float32);
-        tra_cache = np.zeros(new Shape(2, 3, 1, 1, 16), np.float32);
-        inter_cache = np.zeros(new Shape(2, 1, 33, 16), np.float32);
-        window = hann_window(n_fft, dtype: ScalarType.Float32).sqrt();
 
-        // --- 輸出播放緩衝區 ---
-        outputBuffer = new BufferedWaveProvider(new WaveFormat(SampleRate, 16, 1))
+        var window = torch.hann_window(NFFT, dtype: ScalarType.Float32).sqrt();
+
+        using var waveIn = new WasapiCapture();
+        waveIn.WaveFormat = new WaveFormat(SampleRate, 16, 1);
+
+        var playback = new BufferedWaveProvider(new WaveFormat(SampleRate, 16, 1))
         {
-            DiscardOnBufferOverflow = true
+            DiscardOnBufferOverflow = true,
+            BufferLength = SampleRate * 2
+        };
+        var output = new WaveOutEvent();
+        output.Init(playback);
+        output.Play();
+
+        waveIn.DataAvailable += (s, e) =>
+        {
+            // Convert bytes to float
+            int samplesCount = e.BytesRecorded / 2;
+            float[] samples = new float[samplesCount];
+            for (int i = 0; i < samplesCount; i++)
+                samples[i] = BitConverter.ToInt16(e.Buffer, i * 2) / 32768f;
+
+            var tensorWaveform = torch.tensor(samples, dtype: ScalarType.Float32);
+
+            // STFT: [freq, time, 2]
+            var stftTensor = torch.stft(tensorWaveform,
+                n_fft: NFFT,
+                hop_length: HopLength,
+                win_length: WinLength,
+                window: window,
+                return_complex: false);
+
+            // 推論每個 time frame
+            var shape = stftTensor.shape; // [freq, time, 2]
+            int freqBins = (int)shape[0];
+            int frames = (int)shape[1];
+            var inputData = stftTensor.data<float>().ToArray();
+
+            var enhancedReal = new float[frames, freqBins];
+            var enhancedImag = new float[frames, freqBins];
+
+            for (int t = 0; t < frames; t++)
+            {
+                var frame = new DenseTensor<float>(new[] { 1, freqBins, 1, 2 });
+                for (int f = 0; f < freqBins; f++)
+                {
+                    frame[0, f, 0, 0] = inputData[(f * frames + t) * 2];
+                    frame[0, f, 0, 1] = inputData[(f * frames + t) * 2 + 1];
+                }
+
+                var results = session.Run(new[]
+                {
+                    NamedOnnxValue.CreateFromTensor("mix", frame),
+                    NamedOnnxValue.CreateFromTensor("conv_cache", ToDenseTensor(conv_cache)),
+                    NamedOnnxValue.CreateFromTensor("tra_cache", ToDenseTensor(tra_cache)),
+                    NamedOnnxValue.CreateFromTensor("inter_cache", ToDenseTensor(inter_cache))
+                });
+
+                var outFrame = results[0].AsTensor<float>().ToArray();
+                conv_cache = ToArray5D(results[1].AsTensor<float>(), conv_cache);
+                tra_cache = ToArray5D(results[2].AsTensor<float>(), tra_cache);
+                inter_cache = ToArray4D(results[3].AsTensor<float>(), inter_cache);
+
+                for (int f = 0; f < freqBins; f++)
+                {
+                    enhancedReal[t, f] = outFrame[f * 2];
+                    enhancedImag[t, f] = outFrame[f * 2 + 1];
+                }
+            }
+
+            // Rebuild complex tensor
+            var realTensor = torch.tensor(enhancedReal).transpose(0, 1);
+            var imagTensor = torch.tensor(enhancedImag).transpose(0, 1);
+            var complexTensor = torch.complex(realTensor, imagTensor);
+
+            // ISTFT
+            var istftOut = torch.istft(complexTensor,
+                n_fft: NFFT,
+                hop_length: HopLength,
+                win_length: WinLength,
+                window: window,
+                length: samplesCount);
+
+            // Write to playback buffer
+            var outData = istftOut.data<float>().ToArray();
+            byte[] pcmBytes = new byte[outData.Length * 2];
+            for (int i = 0; i < outData.Length; i++)
+            {
+                short sVal = (short)Math.Clamp(outData[i] * 32767, short.MinValue, short.MaxValue);
+                BitConverter.GetBytes(sVal).CopyTo(pcmBytes, i * 2);
+            }
+            playback.AddSamples(pcmBytes, 0, pcmBytes.Length);
         };
 
-        var waveOut = new WaveOutEvent();
-        waveOut.Init(outputBuffer);
-        waveOut.Play();
-
-        // --- 錄音設備 ---
-        var waveIn = new WaveInEvent
-        {
-            WaveFormat = new WaveFormat(SampleRate, 16, 1),
-            BufferMilliseconds = hop_length * 1000 / SampleRate // 每次 buffer 長度對應 hop_length
-        };
-        waveIn.DataAvailable += OnDataAvailable;
         waveIn.StartRecording();
-
-        Console.WriteLine("🎤 即時降噪啟動中... 按 Enter 結束");
+        Console.WriteLine("🎤 Real-time GTCRN Denoising started... Press ENTER to stop.");
         Console.ReadLine();
         waveIn.StopRecording();
-        waveOut.Stop();
     }
 
-    private static void OnDataAvailable(object sender, WaveInEventArgs e)
+    // ======= Helper =======
+    static DenseTensor<float> ToDenseTensor(Array arr)
     {
-        // 把 byte[] 轉 float[]
-        var floatBuffer = new float[e.BytesRecorded / 2];
-        for (int i = 0; i < floatBuffer.Length; i++)
-            floatBuffer[i] = BitConverter.ToInt16(e.Buffer, i * 2) / 32768f;
-
-        foreach (var sample in floatBuffer)
-            processQueue.Enqueue(sample);
-
-        // 處理足夠的 frame
-        while (processQueue.Count >= hop_length)
-        {
-            var frame = new float[hop_length];
-            for (int i = 0; i < hop_length; i++)
-                processQueue.TryDequeue(out frame[i]);
-
-            var denoised = ProcessFrame(frame);
-            // 寫回播放 buffer
-            var outBytes = new byte[denoised.Length * 2];
-            for (int i = 0; i < denoised.Length; i++)
-            {
-                short pcm = (short)(Math.Max(-1, Math.Min(1, denoised[i])) * 32767);
-                BitConverter.GetBytes(pcm).CopyTo(outBytes, i * 2);
-            }
-            outputBuffer.AddSamples(outBytes, 0, outBytes.Length);
-        }
+        var shape = Enumerable.Range(0, arr.Rank).Select(arr.GetLength).ToArray();
+        var flat = arr.Cast<float>().ToArray();
+        return new DenseTensor<float>(flat, shape);
     }
 
-    private static float[] ProcessFrame(float[] frame)
+    static float[,,,,] ToArray5D(Tensor<float> tensor, float[,,,,] template)
     {
-        // STFT（單 frame 需要保留過去 win_length 的資料，這裡簡化成單 frame 處理）
-        var waveform = tensor(frame, dtype: ScalarType.Float32);
-        var stftTensor = stft(waveform,
-                               n_fft: n_fft,
-                               hop_length: hop_length,
-                               win_length: win_length,
-                               window: window,
-                               return_complex: false);
-        var freqBins = (int)stftTensor.shape[0];
-
-        var frameTensor = new DenseTensor<float>(new[] { 1, freqBins, 1, 2 });
-        var data = stftTensor.data<float>().ToArray();
-        for (int j = 0; j < freqBins; j++)
-        {
-            frameTensor[0, j, 0, 0] = data[j * 2];
-            frameTensor[0, j, 0, 1] = data[j * 2 + 1];
-        }
-
-        var result = session.Run(new[]
-        {
-            NamedOnnxValue.CreateFromTensor("mix", frameTensor),
-            NamedOnnxValue.CreateFromTensor("conv_cache", ToDenseTensor(conv_cache)),
-            NamedOnnxValue.CreateFromTensor("tra_cache", ToDenseTensor(tra_cache)),
-            NamedOnnxValue.CreateFromTensor("inter_cache", ToDenseTensor(inter_cache))
-        });
-
-        var out_i = result[0].AsTensor<float>();
-        conv_cache = ToNDArray(result[1].AsTensor<float>());
-        tra_cache = ToNDArray(result[2].AsTensor<float>());
-        inter_cache = ToNDArray(result[3].AsTensor<float>());
-
-        var real = new float[freqBins];
-        var imag = new float[freqBins];
-        for (int j = 0; j < freqBins; j++)
-        {
-            real[j] = out_i[0, j, 0, 0];
-            imag[j] = out_i[0, j, 0, 1];
-        }
-
-        var complexOut = complex(tensor(real), tensor(imag));
-        var istft_out = istft(complexOut,
-                              n_fft: n_fft,
-                              hop_length: hop_length,
-                              win_length: win_length,
-                              window: window,
-                              length: frame.Length);
-
-        return istft_out.data<float>().ToArray();
+        var flat = tensor.ToArray();
+        var result = (float[,,,,])Array.CreateInstance(typeof(float), template.GetLength(0), template.GetLength(1),
+                                                       template.GetLength(2), template.GetLength(3), template.GetLength(4));
+        Buffer.BlockCopy(flat, 0, result, 0, flat.Length * sizeof(float));
+        return result;
     }
 
-    private static DenseTensor<float> ToDenseTensor(NDArray npArray)
+    static float[,,,] ToArray4D(Tensor<float> tensor, float[,,,] template)
     {
-        var data = npArray.astype(np.float32).GetData<float>();
-        return new DenseTensor<float>(data.ToArray(), npArray.shape);
-    }
-
-    private static NDArray ToNDArray(Tensor<float> tensor)
-    {
-        return np.array(tensor.ToArray()).reshape(tensor.Dimensions.ToArray());
+        var flat = tensor.ToArray();
+        var result = (float[,,,])Array.CreateInstance(typeof(float), template.GetLength(0), template.GetLength(1),
+                                                      template.GetLength(2), template.GetLength(3));
+        Buffer.BlockCopy(flat, 0, result, 0, flat.Length * sizeof(float));
+        return result;
     }
 }
